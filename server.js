@@ -1,15 +1,38 @@
+// nano /root/stata-camera-server/server.jsserver.js
 import express from "express";
-import { WebSocketServer } from "ws";
 import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import dotenv from "dotenv";
+import os from "os";
+import { spawn } from "child_process";
+
+dotenv.config();
 
 const app = express();
 const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+const PORT = process.env.PORT || 5037;
+const clients = new Set();
 
 // Middleware
-app.use(express.json({ limit: "10mb" })); // bodyParser.json() o'rniga
+app.use(helmet());
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// CORS sozlamalari (agar kerak bo'lsa)
+// Rate limit (DDOS dan himoya)
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
@@ -17,131 +40,269 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔹 WebSocket serverni HTTP server bilan birlashtirib ishlatish
-const wss = new WebSocketServer({ server });
-
-// Clientlar uchun Set ishlatish (array o'rniga)
-const clients = new Set();
-
-// WebSocket ulanish
+/* ------------------------ WebSocket ulanish ------------------------ */
 wss.on("connection", (ws, req) => {
   const clientIP = req.socket.remoteAddress;
-  console.log(`✅ Yangi client ulandi: ${clientIP}`);
+  console.log(`✅ Yangi client: ${clientIP}`);
+  ws.isAlive = true;
 
   clients.add(ws);
-  console.log(`👥 Jami clientlar soni: ${clients.size}`);
+  console.log(`👥 Clientlar soni: ${clients.size}`);
 
-  // Ping/Pong heartbeat
-  ws.isAlive = true;
+  // Native-level heartbeat javobi (agar client ws ping yuborsa)
+  ws.on("ping", () => {
+    try {
+      ws.pong();
+    } catch {}
+  });
+
   ws.on("pong", () => {
     ws.isAlive = true;
   });
 
-  // Client uzilgan paytda
   ws.on("close", (code, reason) => {
     console.log(
-      `❌ Client uzildi: ${clientIP}, Code: ${code}, Reason: ${reason}`
+      `❌ Client uzildi (${clientIP}) - Code: ${code}, Reason: ${reason}`
     );
     clients.delete(ws);
     console.log(`👥 Qolgan clientlar: ${clients.size}`);
   });
 
-  // Xatoliklarni handle qilish
-  ws.on("error", (error) => {
-    console.error(`🚨 WebSocket xatoligi: ${error.message}`);
+  ws.on("error", (err) => {
+    console.error(`🚨 WebSocket xatolik: ${err.message}`);
     clients.delete(ws);
   });
 
-  // Client message qabul qilish (agar kerak bo'lsa)
   ws.on("message", (data) => {
     try {
-      const message = JSON.parse(data);
-      console.log("📨 Clientdan kelgan message:", message);
-    } catch (error) {
-      console.error("❌ JSON parse xatoligi:", error.message);
+      const message = JSON.parse(data.toString());
+      console.log("📨 Clientdan kelgan xabar:", message);
+
+      // WS ping/pong
+      if (message?.type === "ping") {
+        return ws.send(
+          JSON.stringify({
+            type: "pong",
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
+
+      // 🔄 Hamma clientlarga broadcast qilish (shu clientdan kelgan xabarni)
+      const broadcastMsg = JSON.stringify({
+        type: "client_message",
+        from: clientIP,
+        timestamp: new Date().toISOString(),
+        payload: message,
+      });
+
+      clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(broadcastMsg);
+          } catch (err) {
+            console.error("❌ Broadcast xato:", err.message);
+            clients.delete(client);
+          }
+        }
+      });
+    } catch (err) {
+      console.error("❌ JSON parse xato:", err.message);
     }
   });
 });
 
-// 🔹 Heartbeat - uzilgan connectionlarni tozalash
+/* ------------------------ Heartbeat (server → client) ------------------------ */
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) {
-      console.log("💀 Dead connection tozalanmoqda");
+      console.log("💀 Murdalik client tozalanmoqda");
       clients.delete(ws);
       return ws.terminate();
     }
-
     ws.isAlive = false;
     ws.ping();
   });
-}, 30000); // Har 30 soniyada
+}, 30000);
 
-// 🔹 Hikvision webhook
+/* ------------------------ ICMP ping yordamchi funksiyasi ------------------------ */
+/**
+ * Xavfsiz ICMP ping (spawn orqali, shell yo‘q).
+ *  - Windows: ping -n 1 -w <ms> target
+ *  - Unix:    ping -c 1 -W <s>  target
+ */
+function pingHost(target, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const isWin = os.platform().startsWith("win");
+    const args = isWin
+      ? ["-n", "1", "-w", String(timeoutMs), target]
+      : ["-c", "1", "-W", String(Math.ceil(timeoutMs / 1000)), target];
+
+    const cmd = "ping";
+    const started = Date.now();
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+
+    const killTimer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }, timeoutMs + 500);
+
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      const rtt = Date.now() - started;
+      resolve({
+        ok: code === 0,
+        rtt,
+        code,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+/* ------------------------ Input validatsiya (target) ------------------------ */
+/**
+ * Ruxsat beramiz:
+ *  - IPv4: 0-255.0-255.0-255.0-255 (oddiy tekshiruv)
+ *  - Hostname: harf/raqam, nuqta, tire (RFC-ga yaqin), uzunligi cheklangan
+ *  - IPv6 (oddiy): : va hex belgilar (qisqa tekshiruv)
+ */
+function isValidTarget(str) {
+  if (typeof str !== "string") return false;
+  if (str.length > 255) return false;
+
+  const s = str.trim();
+
+  // IPv4
+  const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+  if (ipv4.test(s)) return true;
+
+  // IPv6 (soddalashtirilgan)
+  const ipv6 = /^[0-9a-fA-F:]+$/;
+  if (s.includes(":") && ipv6.test(s)) return true;
+
+  // Hostname (label-ler orasida nuqta, label [a-z0-9-], tire bosh/oxirda bo‘lmasin)
+  const hostname =
+    /^(?=.{1,253}$)(?!-)([a-zA-Z0-9-]{1,63}(?<!-)\.)*[a-zA-Z0-9-]{1,63}$/;
+  if (hostname.test(s)) return true;
+
+  return false;
+}
+
+/* ------------------------ HTTP ping endpointlari ------------------------ */
+// 1) Soddalashtirilgan server ping
+app.get("/ping", (req, res) => {
+  res.json({
+    pong: true,
+    timestamp: new Date().toISOString(),
+    clients: clients.size,
+    uptime: process.uptime(),
+  });
+});
+
+// 2) Maqsad host/IP ni ICMP orqali ping qilish:
+//    Misollar:
+//      GET /ping/host?target=192.168.1.64
+//      GET /ping/host?target=example.com
+app.get(
+  "/ping/host",
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 30, // bu endpointni alohida cheklab qo'yamiz
+  }),
+  async (req, res) => {
+    try {
+      const raw = (req.query.target || "").toString().trim();
+      if (!raw) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: "target kerak, masalan: /ping/host?target=192.168.1.64",
+          });
+      }
+
+      if (!isValidTarget(raw)) {
+        return res
+          .status(400)
+          .json({ success: false, error: "target noto‘g‘ri formatda" });
+      }
+
+      const timeoutMs = Math.min(
+        Math.max(Number(req.query.timeoutMs) || 2000, 500),
+        10000
+      ); // 0.5s–10s
+      const result = await pingHost(raw, timeoutMs);
+
+      res.json({
+        success: result.ok,
+        target: raw,
+        rtt_ms: result.rtt,
+        exitCode: result.code,
+        // stdout/stderr diagnostika uchun foydali bo'lishi mumkin
+        stdout: result.stdout,
+        stderr: result.stderr,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("🚨 /ping/host xato:", err.message);
+      res.status(500).json({ success: false, error: "Server xatoligi" });
+    }
+  }
+);
+
+/* ------------------------ Webhook qabul qilish ------------------------ */
 app.post("/webhook", (req, res) => {
   try {
     const eventData = req.body;
-
-    // Ma'lumot validatsiyasi
     if (!eventData) {
-      return res.status(400).json({
-        success: false,
-        error: "Ma'lumot topilmadi",
-      });
+      return res.status(400).json({ success: false, error: "Ma'lumot yo‘q" });
     }
 
     console.log("📩 Hikvision event:", JSON.stringify(eventData, null, 2));
 
-    // Clientlar sonini tekshirish
-    if (clients.size === 0) {
-      console.log("⚠️ Hech qanday client ulanmagan");
-      return res.json({
-        success: true,
-        message: "Event qabul qilindi, lekin clientlar yo'q",
-        clientCount: 0,
-      });
-    }
-
-    // Faqat ochiq connectionlarga yuborish
-    let sentCount = 0;
     const message = JSON.stringify({
       type: "hikvision_event",
       timestamp: new Date().toISOString(),
       data: eventData,
     });
 
+    let sentCount = 0;
+
     clients.forEach((client) => {
-      if (client.readyState === client.OPEN) {
+      if (client.readyState === WebSocket.OPEN) {
         try {
           client.send(message);
           sentCount++;
-        } catch (error) {
-          console.error("❌ Clientga yuborishda xatolik:", error.message);
+        } catch (err) {
+          console.error("❌ Clientga yuborishda xato:", err.message);
           clients.delete(client);
         }
       } else {
-        // Yopilgan connectionlarni tozalash
         clients.delete(client);
       }
     });
 
     console.log(`✅ ${sentCount} ta clientga yuborildi`);
-
     res.json({
       success: true,
       clientCount: sentCount,
       timestamp: new Date().toISOString(),
     });
-  } catch (error) {
-    console.error("🚨 Webhook xatoligi:", error.message);
-    res.status(500).json({
-      success: false,
-      error: "Server xatoligi",
-    });
+  } catch (err) {
+    console.error("🚨 Webhook xato:", err.message);
+    res.status(500).json({ success: false, error: "Server xatoligi" });
   }
 });
 
-// 🔹 Health check endpoint
+/* ------------------------ Sog‘liqni tekshirish ------------------------ */
 app.get("/health", (req, res) => {
   res.json({
     status: "OK",
@@ -151,49 +312,51 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 🔹 Root endpoint
+/* ------------------------ Root ------------------------ */
 app.get("/", (req, res) => {
   res.json({
-    message: "Hikvision WebSocket Server",
+    message: "🔐 Hikvision WebSocket Server",
     endpoints: {
       webhook: "POST /webhook",
       health: "GET /health",
+      ping: "GET /ping",
+      pingHost: "GET /ping/host?target=<host|ip>&timeoutMs=2000",
     },
-    websocket: "ws://localhost:PORT",
+    websocket: `ws://localhost:${PORT}`,
   });
 });
 
-// 🔹 Error handling middleware
+/* ------------------------ Global error handling ------------------------ */
 app.use((err, req, res, next) => {
-  console.error("🚨 Server xatoligi:", err.stack);
-  res.status(500).json({
-    success: false,
-    error: "Internal Server Error",
-  });
+  console.error("🚨 Global xatolik:", err.stack);
+  res.status(500).json({ success: false, error: "Internal Server Error" });
 });
 
-// 🔹 Graceful shutdown
+/* ------------------------ Graceful shutdown ------------------------ */
 process.on("SIGINT", () => {
-  console.log("\n🛑 Server to'xtatilmoqda...");
+  console.log("\n🛑 Server to‘xtatilmoqda...");
 
   clearInterval(heartbeat);
 
-  // Barcha clientlarni yopish
   clients.forEach((client) => {
-    client.close(1000, "Server shutdown");
+    try {
+      client.close(1000, "Server shutdown");
+    } catch {}
   });
 
   server.close(() => {
-    console.log("✅ Server muvaffaqiyatli to'xtatildi");
+    console.log("✅ Server o‘chirildi");
     process.exit(0);
   });
 });
 
-// 🔹 Serverni ishga tushirish
-const PORT = process.env.PORT || 8050;
+/* ------------------------ Serverni ishga tushirish ------------------------ */
 server.listen(PORT, () => {
-  console.log(`🚀 Server ${PORT}-portda ishlayapti`);
-  console.log(`🔗 HTTP: http://localhost:${PORT}`);
-  console.log(`🔗 WebSocket: ws://localhost:${PORT}`);
+  console.log(`🚀 HTTP server: http://localhost:${PORT}`);
+  console.log(`🔌 WebSocket: ws://localhost:${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🏓 Ping: http://localhost:${PORT}/ping`);
+  console.log(
+    `🎯 Host ping: http://localhost:${PORT}/ping/host?target=example.com`
+  );
 });
