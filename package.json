@@ -1,0 +1,22 @@
+{
+  "name": "hikvision-websocket-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Hikvision webhook to WebSocket server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.3"
+  },
+  "keywords": [
+    "hikvision",
+    "websocket",
+    "webhook"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
