@@ -30,7 +30,7 @@ app.use(
     standardHeaders: true,
     legacyHeaders: false,
   })
-);
+); 
 
 // CORS
 app.use((req, res, next) => {
