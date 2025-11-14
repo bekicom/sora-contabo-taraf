@@ -14,7 +14,7 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const PORT = process.env.PORT || 5037;
+const PORT = process.env.PORT || 8062;
 const clients = new Set();
 
 // Middleware
